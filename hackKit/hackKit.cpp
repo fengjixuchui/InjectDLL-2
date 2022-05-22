@@ -1,12 +1,16 @@
 #include "hackKit.h"
 #include <psapi.h>
 #include <shlwapi.h>
+#include <imagehlp.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <assert.h>
+#include <tchar.h>
 #include "../config.h"
 
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "psapi.lib")
+#pragma comment(lib, "imagehlp.lib")
 
 struct AutoCloseHandle
 {
@@ -18,7 +22,7 @@ struct AutoCloseHandle
     {
         CloseHandle(m_h);
     }
-    operator HANDLE()
+    operator HANDLE&()
     {
         return m_h;
     }
@@ -76,12 +80,12 @@ DWORD getProcessBinaryType(HANDLE hProcess)
     if (hProcess == NULL)
         hProcess = GetCurrentProcess();
 
-    WCHAR szPath[MAX_PATH];
-    if (!GetModuleFileNameExW(hProcess, NULL, szPath, _countof(szPath)))
+    TCHAR szPath[MAX_PATH];
+    if (!GetModuleFileNameEx(hProcess, NULL, szPath, _countof(szPath)))
         return -1;
 
     DWORD dwType;
-    if (!GetBinaryTypeW(szPath, &dwType))
+    if (!GetBinaryType(szPath, &dwType))
         return -1;
 
     return dwType;
@@ -521,4 +525,86 @@ BOOL getSameFolderPathName(LPTSTR pszPathName, LPCTSTR pszFileTitle)
     PathRemoveFileSpec(pszPathName);
     PathAppend(pszPathName, pszFileTitle);
     return TRUE;
+}
+
+static LPVOID
+doImportTable(HMODULE hModule, PIMAGE_IMPORT_DESCRIPTOR pImport, LPCSTR pszFuncName, LPVOID fnNew)
+{
+    LPBYTE pbBase = (LPBYTE)hModule;
+    for (; pImport->OriginalFirstThunk; pImport++)
+    {
+        LPCSTR pszDllName = (LPCSTR)(pbBase + pImport->Name);
+        PIMAGE_THUNK_DATA pThunc, pOriginalThunk;
+        pThunc = (PIMAGE_THUNK_DATA)(pbBase + pImport->FirstThunk);
+        pOriginalThunk = (PIMAGE_THUNK_DATA)(pbBase + pImport->OriginalFirstThunk);
+        for (; pThunc->u1.Function; ++pThunc, ++pOriginalThunk)
+        {
+            if (HIWORD(pszFuncName) == 0)
+            {
+                if (!IMAGE_SNAP_BY_ORDINAL(pOriginalThunk->u1.Ordinal))
+                    continue;
+
+                WORD wOrdinal = IMAGE_ORDINAL(pOriginalThunk->u1.Ordinal);
+                if (wOrdinal != LOWORD(pszFuncName))
+                    continue;
+            }
+            else
+            {
+                if (IMAGE_SNAP_BY_ORDINAL(pOriginalThunk->u1.Ordinal))
+                    continue;
+
+                PIMAGE_IMPORT_BY_NAME pName =
+                    (PIMAGE_IMPORT_BY_NAME)(pbBase + pOriginalThunk->u1.AddressOfData);
+                if (stricmp((LPCSTR)pName->Name, pszFuncName) != 0)
+                    continue;
+            }
+
+            DWORD dwOldProtect;
+            if (!VirtualProtect(&pThunc->u1.Function, sizeof(pThunc->u1.Function),
+                                PAGE_READWRITE, &dwOldProtect))
+                return NULL;
+
+            LPVOID fnOriginal = (LPVOID)(ULONG_PTR)pThunc->u1.Function;
+            WriteProcessMemory(GetCurrentProcess(), &pThunc->u1.Function, &fnNew,
+                               sizeof(pThunc->u1.Function), NULL);
+            pThunc->u1.Function = (ULONG_PTR)fnNew;
+
+            VirtualProtect(&pThunc->u1.Function, sizeof(pThunc->u1.Function),
+                           dwOldProtect, &dwOldProtect);
+            return fnOriginal;
+        }
+    }
+
+    return NULL;
+}
+
+LPVOID doHookAPI(HMODULE hModule, LPCSTR pszModuleName, LPCSTR pszFuncName, LPVOID fnNew)
+{
+    if (!fnNew)
+        return NULL;
+    if (!pszFuncName)
+        return NULL;
+    if (!hModule)
+        hModule = GetModuleHandleA(NULL);
+
+    DWORD dwSize;
+    PIMAGE_IMPORT_DESCRIPTOR pImport;
+    pImport = (PIMAGE_IMPORT_DESCRIPTOR)ImageDirectoryEntryToData(
+        hModule, TRUE, IMAGE_DIRECTORY_ENTRY_IMPORT, &dwSize);
+    LPVOID fnOriginal = doImportTable(hModule, pImport, pszFuncName, fnNew);
+    if (fnOriginal)
+        return fnOriginal;
+
+    return NULL;
+}
+
+BOOL startProcess(LPCTSTR cmdline, STARTUPINFO& si, PROCESS_INFORMATION& pi,
+                  DWORD dwCreation, LPCTSTR pszCurDir)
+{
+    assert(cmdline);
+    LPTSTR pszCmdLine = _tcsdup(cmdline);
+    assert(pszCmdLine);
+    BOOL ret = CreateProcess(NULL, pszCmdLine, NULL, NULL, TRUE, dwCreation, NULL, pszCurDir, &si, &pi);
+    free(pszCmdLine);
+    return ret;
 }
